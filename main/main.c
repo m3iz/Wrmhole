@@ -104,7 +104,7 @@ typedef struct __attribute__((packed)) {
 /* ===== Prototypes ===== */
 static void wifi_init_sta(void);
 static void wifi_init_ap(void);
-static void scan_task(void *arg);
+
 
 /* ===== Vendor OUI lookup ===== */
 typedef struct { const char *prefix; const char *name; } oui_entry_t;
@@ -1030,35 +1030,56 @@ static void IRAM_ATTR promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type
     }
 
     /* Also catch data frames to learn associated clients */
-    if (type == WIFI_PKT_DATA) {
-        /* addr1=receiver, addr2=sender in data frames */
+    if (type == WIFI_PKT_DATA && len >= 24) {
+        /* 802.11 data frame: addr1=receiver, addr2=sender, addr3=BSSID (To AP) or BSSID (From AP) */
         uint8_t *addr1 = (uint8_t *)(frame + 4);
         uint8_t *addr2 = (uint8_t *)(frame + 10);
+        uint8_t *addr3 = (uint8_t *)(frame + 16);
 
-        for (int a = 0; a < 2; a++) {
-            uint8_t *addr = (a == 0) ? addr1 : addr2;
-            /* Skip multicast/broadcast */
-            if (addr[0] & 0x01) continue;
-            /* Skip AP BSSIDs we already know */
-            bool is_ap = false;
+        /* Filter: only care about frames involving the target AP's BSSID */
+        bool to_ap   = (s_client_count == 0 || memcmp(addr3, s_clients[0].mac, 6) == 0);
+        bool from_ap = false;
+
+        /* addr3 might be the target BSSID */
+        for (int i = 0; i < s_network_count; i++) {
+            if (memcmp(addr3, s_networks[i].bssid, 6) == 0) {
+                from_ap = true;
+                break;
+            }
+        }
+
+        /* If this frame is TO the AP (addr3 == BSSID), then addr2 is the client */
+        /* If this frame is FROM the AP (addr2 == BSSID), then addr1 is the client */
+        uint8_t *client_mac = NULL;
+        if (from_ap) {
+            /* From AP — addr1 is client (skip broadcast) */
+            if (!(addr1[0] & 0x01)) client_mac = addr1;
+        } else {
+            /* Try to detect if addr3 matches a known AP BSSID */
+            bool addr3_is_ap = false;
             for (int i = 0; i < s_network_count; i++) {
-                if (memcmp(s_networks[i].bssid, addr, 6) == 0) {
-                    is_ap = true;
+                if (memcmp(addr3, s_networks[i].bssid, 6) == 0) {
+                    addr3_is_ap = true;
                     break;
                 }
             }
-            if (is_ap) continue;
+            if (addr3_is_ap) {
+                /* To AP — addr2 is client */
+                if (!(addr2[0] & 0x01)) client_mac = addr2;
+            }
+        }
 
+        if (client_mac) {
             bool found = false;
             for (int i = 0; i < s_client_count; i++) {
-                if (memcmp(s_clients[i].mac, addr, 6) == 0) {
+                if (memcmp(s_clients[i].mac, client_mac, 6) == 0) {
                     s_clients[i].rssi = pkt->rx_ctrl.rssi;
                     found = true;
                     break;
                 }
             }
             if (!found && s_client_count < MAX_CLIENTS) {
-                memcpy(s_clients[s_client_count].mac, addr, 6);
+                memcpy(s_clients[s_client_count].mac, client_mac, 6);
                 s_clients[s_client_count].rssi    = pkt->rx_ctrl.rssi;
                 s_clients[s_client_count].channel = pkt->rx_ctrl.channel;
                 s_client_count++;
@@ -1067,69 +1088,6 @@ static void IRAM_ATTR promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type
     }
 }
 
-static void scan_task(void *arg)
-{
-    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-
-    /* Stop promiscuous first */
-    esp_wifi_set_promiscuous(false);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    s_network_count = 0;
-    s_client_count  = 0;
-
-    /* Use ESP-IDF scan API — works in STA mode */
-    wifi_scan_config_t scan_cfg = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = false,
-    };
-
-    ESP_LOGI(TAG, "Starting WiFi scan...");
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
-        xSemaphoreGive(s_scan_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count > MAX_NETWORKS) ap_count = MAX_NETWORKS;
-
-    wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
-    if (ap_records) {
-        esp_wifi_scan_get_ap_records(&ap_count, ap_records);
-        for (int i = 0; i < ap_count; i++) {
-            memcpy(s_networks[s_network_count].bssid, ap_records[i].bssid, 6);
-            s_networks[s_network_count].rssi    = ap_records[i].rssi;
-            s_networks[s_network_count].channel = ap_records[i].primary;
-            strncpy(s_networks[s_network_count].ssid, (char *)ap_records[i].ssid, 32);
-            s_networks[s_network_count].ssid[32] = '\0';
-            s_network_count++;
-        }
-        free(ap_records);
-    }
-
-    ESP_LOGI(TAG, "Found %d networks. Scanning clients (5s)...", s_network_count);
-
-    /* Now scan for clients via promiscuous mode */
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
-
-    for (int ch = 1; ch <= 13; ch++) {
-        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(400));
-    }
-
-    esp_wifi_set_promiscuous(false);
-
-    ESP_LOGI(TAG, "Scan done: %d networks, %d clients", s_network_count, s_client_count);
-    xSemaphoreGive(s_scan_mutex);
-    vTaskDelete(NULL);
-}
 
 /* =====================================================
  *  Deauth
@@ -1251,7 +1209,7 @@ static const char index_html[] =
 "<h1>ESP32 Deauth Tool</h1>"
 "<div class='card'><h2 id='sht'>STATUS</h2><div class='st' id='st'>Loading...</div>"
 "<button onclick='refresh()'>Refresh</button>"
-"<button onclick='scan()'>Scan</button></div>"
+"<button id='scanbtn' onclick='scan()'>Scan</button></div>"
 "<div class='card'><h2>NETWORKS</h2><div id='nets'>Click Scan</div></div>"
 "<div class='card'><h2>CLIENTS</h2><div id='cls'>Click Scan</div></div>"
 "<div class='card'><h2>WHITELIST</h2><div id='wl'>Empty</div>"
@@ -1284,7 +1242,8 @@ static const char index_html[] =
 "st.className=_on?'st on pulse':'st';"
 "sh.innerHTML=_on?'<span style=color:#f44>&#9679;</span> ATTACK RUNNING':'STATUS';}"
 "function refresh(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){upSt(d)}).catch(function(e){L('Error: '+e)})}"
-"function scan(){L('Scanning...');fetch('/api/scan').then(function(r){return r.json()}).then(function(d){"
+"function scan(){var b=document.getElementById('scanbtn');b.disabled=true;b.textContent='Scanning...';b.style.background='#f44';"
+"L('Scanning...');fetch('/api/scan').then(function(r){return r.json()}).then(function(d){"
 "var h='<table><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>RSSI</th></tr>';"
 "d.networks.forEach(function(n){h+='<tr><td>'+n.ssid+'</td><td>'+n.bssid+'</td><td>'+n.channel+'</td><td>'+n.rssi+'</td></tr>'});h+='</table>';"
 "document.getElementById('nets').innerHTML=h;"
@@ -1298,7 +1257,8 @@ static const char index_html[] =
 "document.getElementById('cls').innerHTML=h;"
 "var s=document.getElementById('csl');s.innerHTML='<option value=\"\">Select</option>';"
 "d.clients.forEach(function(c){s.innerHTML+='<option value=\"'+c.mac+'\">'+c.mac+' ('+c.vendor+')</option>'});"
-"L('Found: '+d.networks.length+' networks, '+d.clients.length+' clients');})}"
+"L('Found: '+d.networks.length+' networks, '+d.clients.length+' clients');"
+"b.disabled=false;b.textContent='Scan';b.style.background='';})}"
 "function wladd(){var m=document.getElementById('wlmac').value;if(!m){return}"
 "fetch('/api/whitelist/add?mac='+m).then(function(r){return r.json()}).then(function(d){L('Whitelist: '+d.count);wlrefresh();scan()})}"
 "function wladdm(m){"
@@ -1383,17 +1343,61 @@ static esp_err_t handle_scan(httpd_req_t *req)
         cJSON_Delete(json);
         return ESP_OK;
     }
+
+    s_network_count = 0;
+    s_client_count  = 0;
+
+    /* ESP-IDF WiFi scan — find networks */
+    wifi_scan_config_t scan_cfg = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false };
+    ESP_LOGI(TAG, "Starting WiFi scan...");
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_scan_mutex);
+        cJSON *json = cJSON_CreateObject();
+        cJSON_AddStringToObject(json, "status", "scan failed");
+        char *str = cJSON_PrintUnformatted(json);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, str, strlen(str));
+        cJSON_free(str);
+        cJSON_Delete(json);
+        return ESP_OK;
+    }
+
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    if (ap_count > MAX_NETWORKS) ap_count = MAX_NETWORKS;
+
+    wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+    if (ap_records) {
+        esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+        for (int i = 0; i < ap_count; i++) {
+            memcpy(s_networks[s_network_count].bssid, ap_records[i].bssid, 6);
+            s_networks[s_network_count].rssi    = ap_records[i].rssi;
+            s_networks[s_network_count].channel = ap_records[i].primary;
+            strncpy(s_networks[s_network_count].ssid, (char *)ap_records[i].ssid, 32);
+            s_networks[s_network_count].ssid[32] = '\0';
+            s_network_count++;
+        }
+        free(ap_records);
+    }
+
+    ESP_LOGI(TAG, "Found %d networks. Scanning clients (10s)...", s_network_count);
+
+    /* Promiscuous scan — find clients by capturing data frames */
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
+
+    for (int ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+
+    esp_wifi_set_promiscuous(false);
+
     xSemaphoreGive(s_scan_mutex);
 
-    xTaskCreate(scan_task, "scan", 8192, NULL, 5, NULL);
-
-    /* Wait up to 12 seconds for scan to finish */
-    for (int i = 0; i < 120; i++) {
-        if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            xSemaphoreGive(s_scan_mutex);
-            break;
-        }
-    }
+    ESP_LOGI(TAG, "Scan done: %d networks, %d clients", s_network_count, s_client_count);
 
     cJSON *json = cJSON_CreateObject();
     cJSON *nets = cJSON_AddArrayToObject(json, "networks");

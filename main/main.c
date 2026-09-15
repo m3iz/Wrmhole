@@ -144,6 +144,8 @@ static const oui_entry_t s_oui_table[] = {
     {"2C:CF:67", "Raspberry Pi"},
     {"94:B5:55", "Raspberry Pi"},
     {"24:0A:C4", "Raspberry Pi"},
+    {"D0:C5:D3", "AzureWave"},
+    {"74:7A:90", "Murata"},
     {"00:1A:2B", "Apple"},
     {"00:1B:63", "Apple"},
     {"00:1C:B3", "Apple"},
@@ -839,10 +841,15 @@ static const oui_entry_t s_oui_table[] = {
     {"40:ED:00", "Intel"},
     {"40:EE:DD", "Intel"},
     {"40:EF:02", "Intel"},
+    {"48:89:E7", "Intel"},
+    {"B8:09:8A", "Apple"},
+    {"78:E6:1C", "Honor"},
     {NULL, NULL}
 };
 
 static const char *lookup_vendor(const uint8_t *mac) {
+    /* Locally administered MAC (randomized) — OUI lookup is meaningless */
+    if (mac[0] & 0x02) return "Randomized";
     char prefix[9];
     snprintf(prefix, sizeof(prefix), "%02X:%02X:%02X", mac[0], mac[1], mac[2]);
     for (int i = 0; s_oui_table[i].prefix != NULL; i++) {

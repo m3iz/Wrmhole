@@ -1,3 +1,5 @@
-idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS "."
-                       REQUIRES esp_wifi esp_event nvs_flash esp_netif esp_http_server esp_timer json bt)
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES app_state config scan deauth ble_spam web_server
+)

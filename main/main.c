@@ -1630,6 +1630,7 @@ static const char index_html[] =
 "<button id='scanbtn' onclick='scan()'>Scan</button></div>"
 "<div class='card'><h2>NETWORKS</h2><div id='nets'>Click Scan</div></div>"
 "<div class='card'><h2>CLIENTS</h2><div id='cls'>Click Scan</div></div>"
+"<div class='card'><h2>MONITOR</h2><div id='mon'>Auto-updates every 2s</div></div>"
 "<div class='card'><h2>WHITELIST</h2><div id='wl'>Empty</div>"
 "<div><input type='text' id='wlmac' placeholder='AA:BB:CC:DD:EE:FF' style='width:160px'>"
 "<button onclick='wladd()'>Add</button></div></div>"
@@ -1681,7 +1682,13 @@ static const char index_html[] =
 "sh.innerHTML=_on?'<span style=color:#f44>&#9679;</span> ATTACK RUNNING':'STATUS';"
 "document.getElementById('ble_count').textContent=d.ble_spam_count||0;"
 "document.getElementById('cur_ssid').textContent=d.ssid||'-';"
-"document.getElementById('cur_conn').textContent=d.wifi?'Yes':'No';}"
+"document.getElementById('cur_conn').textContent=d.wifi?'Yes':'No';"
+"if(d.clients_detail&&d.clients_detail.length>0){"
+"var m='<table><tr><th>MAC</th><th>Vendor</th><th>RSSI</th><th>Ch</th></tr>';"
+"d.clients_detail.forEach(function(c){"
+"var color=c.rssi>-50?'#0f0':c.rssi>-70?'#ff0':'#f44';"
+"m+='<tr><td>'+c.mac+'</td><td>'+c.vendor+'</td><td style=\"color:'+color+'\">'+c.rssi+' dBm</td><td>'+c.channel+'</td></tr>';"
+"});m+='</table>';document.getElementById('mon').innerHTML=m;}"
 "function refresh(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){upSt(d)}).catch(function(e){L('Error: '+e)})}"
 "function scan(){var b=document.getElementById('scanbtn');b.disabled=true;b.textContent='Scanning...';b.style.background='#f44';"
 "L('Scanning...');fetch('/api/scan').then(function(r){return r.json()}).then(function(d){"
@@ -1777,6 +1784,22 @@ static esp_err_t handle_status(httpd_req_t *req)
     cJSON_AddBoolToObject(json, "ble_spam", s_ble_spam_running);
     cJSON_AddNumberToObject(json, "ble_spam_count", s_ble_spam_count);
 
+    /* Real-time client RSSI list */
+    cJSON *cl_arr = cJSON_AddArrayToObject(json, "clients_detail");
+    for (int i = 0; i < s_client_count && i < 30; i++) {
+        cJSON *cl = cJSON_CreateObject();
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_clients[i].mac[0], s_clients[i].mac[1], s_clients[i].mac[2],
+                 s_clients[i].mac[3], s_clients[i].mac[4], s_clients[i].mac[5]);
+        cJSON_AddStringToObject(cl, "mac", mac);
+        cJSON_AddStringToObject(cl, "vendor", lookup_vendor(s_clients[i].mac));
+        cJSON_AddNumberToObject(cl, "rssi", s_clients[i].rssi);
+        cJSON_AddNumberToObject(cl, "channel", s_clients[i].channel);
+        cJSON_AddBoolToObject(cl, "whitelisted", is_whitelisted(s_clients[i].mac));
+        cJSON_AddItemToArray(cl_arr, cl);
+    }
+
     char *str = cJSON_PrintUnformatted(json);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, str, strlen(str));
@@ -1798,7 +1821,7 @@ static esp_err_t handle_scan(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* ESP-IDF WiFi scan — find networks (only add new) */
+    /* ESP-IDF WiFi scan — find networks (incremental) */
     wifi_scan_config_t scan_cfg = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false };
     ESP_LOGI(TAG, "Starting WiFi scan...");
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
@@ -1823,7 +1846,6 @@ static esp_err_t handle_scan(httpd_req_t *req)
     if (ap_records) {
         esp_wifi_scan_get_ap_records(&ap_count, ap_records);
         for (int i = 0; i < ap_count; i++) {
-            /* Only add if not already known */
             bool found = false;
             for (int j = 0; j < s_network_count; j++) {
                 if (memcmp(s_networks[j].bssid, ap_records[i].bssid, 6) == 0) {
@@ -1844,19 +1866,16 @@ static esp_err_t handle_scan(httpd_req_t *req)
         free(ap_records);
     }
 
-    ESP_LOGI(TAG, "Found %d networks. Scanning clients (10s)...", s_network_count);
+    ESP_LOGI(TAG, "Found %d networks. Scanning clients...", s_network_count);
+    s_client_count = 0;
 
-    /* Promiscuous scan — find clients by capturing data frames */
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
-
     for (int ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-
     esp_wifi_set_promiscuous(false);
-
     xSemaphoreGive(s_scan_mutex);
 
     ESP_LOGI(TAG, "Scan done: %d networks, %d clients", s_network_count, s_client_count);
@@ -2290,6 +2309,69 @@ static void start_web_server(void)
 }
 
 /* =====================================================
+ *  Auto-scan on boot
+ * ===================================================== */
+
+static void boot_scan_task(void *arg)
+{
+    /* Wait for WiFi connection + web server to start */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "Auto-scan on boot...");
+
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Auto-scan: mutex timeout");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* WiFi scan */
+    wifi_scan_config_t scan_cfg = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false };
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err == ESP_OK) {
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        if (ap_count > MAX_NETWORKS) ap_count = MAX_NETWORKS;
+        wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+        if (ap_records) {
+            esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+            for (int i = 0; i < ap_count; i++) {
+                bool found = false;
+                for (int j = 0; j < s_network_count; j++) {
+                    if (memcmp(s_networks[j].bssid, ap_records[i].bssid, 6) == 0) {
+                        s_networks[j].rssi = ap_records[i].rssi;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && s_network_count < MAX_NETWORKS) {
+                    memcpy(s_networks[s_network_count].bssid, ap_records[i].bssid, 6);
+                    s_networks[s_network_count].rssi    = ap_records[i].rssi;
+                    s_networks[s_network_count].channel = ap_records[i].primary;
+                    strncpy(s_networks[s_network_count].ssid, (char *)ap_records[i].ssid, 32);
+                    s_networks[s_network_count].ssid[32] = '\0';
+                    s_network_count++;
+                }
+            }
+            free(ap_records);
+        }
+    }
+
+    /* Promiscuous scan for clients */
+    s_client_count = 0;
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
+    for (int ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    esp_wifi_set_promiscuous(false);
+
+    xSemaphoreGive(s_scan_mutex);
+    ESP_LOGI(TAG, "Auto-scan done: %d networks, %d clients", s_network_count, s_client_count);
+    vTaskDelete(NULL);
+}
+
+/* =====================================================
  *  Main
  * ===================================================== */
 
@@ -2310,6 +2392,9 @@ void app_main(void)
     init_ble();
     wifi_init_sta();
     start_web_server();
+
+    /* Auto-scan on boot — populate clients/networks */
+    xTaskCreate(boot_scan_task, "boot_scan", 4096, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "Ready! Open http://<ESP_IP> in browser");
 }

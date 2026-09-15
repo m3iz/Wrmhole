@@ -49,7 +49,7 @@ static const char index_html[] =
 "<br><button class='d' onclick='ble_start()'>START BLE SPAM</button>"
 "<button onclick='ble_stop()'>STOP</button></div>"
 "<div class='card'><h2>DEAUTH ATTACK</h2>"
-"<div><select id='tgt' onchange='document.getElementById(\"csl\").style.display=this.value==\"manual\"?\"inline-block\":\"none\";document.getElementById(\"manmac\").style.display=this.value==\"manual\"?\"inline-block\":\"none\"'>"
+"<div><select id='tgt' onchange='document.getElementById(\"csl\").style.display=this.value==\"client\"?\"inline-block\":\"none\";document.getElementById(\"manmac\").style.display=this.value==\"manual\"?\"inline-block\":\"none\"'>"
 "<option value='all'>All (broadcast)</option>"
 "<option value='client'>Specific client (from scan)</option>"
 "<option value='manual'>Manual MAC</option></select>"

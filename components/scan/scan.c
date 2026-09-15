@@ -63,6 +63,11 @@ static void IRAM_ATTR promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type
         if (frame_subtype == 4) {
             uint8_t *src = (uint8_t *)(frame + 10);
             if (mac_is_multicast(src)) return;
+            bool is_ap = false;
+            for (int i = 0; i < s_network_count; i++) {
+                if (mac_eq(src, s_networks[i].bssid)) { is_ap = true; break; }
+            }
+            if (is_ap) return;
             bool found = false;
             for (int i = 0; i < s_client_count; i++) {
                 if (mac_eq(s_clients[i].mac, src)) {
@@ -102,6 +107,12 @@ static void IRAM_ATTR promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type
         }
 
         if (client_mac) {
+            bool is_ap = false;
+            for (int i = 0; i < s_network_count; i++) {
+                if (mac_eq(client_mac, s_networks[i].bssid)) { is_ap = true; break; }
+            }
+            if (is_ap) return;
+
             bool found = false;
             for (int i = 0; i < s_client_count; i++) {
                 if (mac_eq(s_clients[i].mac, client_mac)) {
